@@ -7,9 +7,9 @@ use crate::{event, Interest, Registry, Token};
 use toyos_abi::RawHandle;
 use toyos_abi::syscall;
 
-/// A TCP listener backed by kernel pipes via netd.
+/// A TCP listener backed by kernel pipes via netstack.
 ///
-/// netd writes a byte to the notify pipe when a new connection arrives.
+/// netstack writes a byte to the notify pipe when a new connection arrives.
 /// Polling the notify handle for readability indicates a connection is ready
 /// to accept.
 pub struct TcpListener {

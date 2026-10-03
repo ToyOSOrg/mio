@@ -7,7 +7,7 @@ use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, SyscallError};
 use toyos::net::{NetError, TcpSocketId};
 
-/// A non-blocking TCP stream backed by kernel pipes via netd.
+/// A non-blocking TCP stream backed by kernel pipes via netstack.
 pub struct TcpStream {
     rx_handle: RawHandle,
     tx_handle: RawHandle,
@@ -24,14 +24,14 @@ pub(crate) fn net_err_to_io(e: NetError) -> io::Error {
         NetError::AddrInUse => io::ErrorKind::AddrInUse,
         NetError::NotConnected => io::ErrorKind::NotConnected,
         NetError::InvalidInput => io::ErrorKind::InvalidInput,
-        NetError::NetdNotFound => io::ErrorKind::NotConnected,
+        NetError::NetstackNotFound => io::ErrorKind::NotConnected,
         _ => io::ErrorKind::Other,
     };
-    io::Error::new(kind, "netd error")
+    io::Error::new(kind, "netstack error")
 }
 
 impl TcpStream {
-    /// Issue a non-blocking connect to the specified address via netd.
+    /// Issue a non-blocking connect to the specified address via netstack.
     pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let ip = match addr {
             SocketAddr::V4(v4) => v4.ip().octets(),
@@ -51,7 +51,7 @@ impl TcpStream {
         })
     }
 
-    /// Create a TcpStream from pipe ends netd already handed over (used by
+    /// Create a TcpStream from pipe ends netstack already handed over (used by
     /// TcpListener::accept).
     pub(crate) fn from_accepted(accepted: toyos::net::TcpAccepted) -> TcpStream {
         let peer_addr = SocketAddr::from((accepted.remote_addr, accepted.remote_port));
