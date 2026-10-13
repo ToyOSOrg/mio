@@ -9,6 +9,10 @@ use toyos_abi::inbox::*;
 
 static NEXT_SELECTOR_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// A watch's token carries this bit where the handle is a stream's bell,
+/// watched for reading and reported as writable (`std::os::toyos::net`).
+const BELL: u64 = 1 << 63;
+
 /// A ToyOS inbox: submission and completion rings mapped into userspace.
 struct Inbox {
     handle: RawHandle,
@@ -119,7 +123,9 @@ struct Registration {
 
 #[derive(Debug)]
 struct SelectorInner {
-    registrations: Vec<(RawHandle, Interest, Token)>,
+    /// Each handle, the interest it is watched for, its token, and whether it
+    /// is a bell.
+    registrations: Vec<(RawHandle, Interest, Token, bool)>,
 }
 
 #[derive(Clone)]
@@ -171,17 +177,18 @@ impl Selector {
         events.clear();
 
         // Re-arm a watch for every registration
-        let regs: Vec<(RawHandle, Interest, Token)> = {
+        let regs: Vec<(RawHandle, Interest, Token, bool)> = {
             let inner = self.inner.lock().unwrap();
             inner.registrations.clone()
         };
 
-        for &(handle, interest, token) in &regs {
+        for &(handle, interest, token, bell) in &regs {
+            debug_assert!(token.0 as u64 & BELL == 0, "a token past the bell's bit");
             let mut submission = Submission::default();
             submission.op = OP_WATCH;
             submission.handle = handle;
             submission.op_flags = interests_to_flags(interest);
-            submission.token = token.0 as u64;
+            submission.token = token.0 as u64 | if bell { BELL } else { 0 };
             self.inbox.queue(&submission);
         }
 
@@ -198,14 +205,13 @@ impl Selector {
         // Drain all completions
         while let Some(completion) = self.inbox.peek_completion() {
             if completion.result > 0 {
-                let flags = poll_result_to_flags(completion.result as u32);
-                if let Some(existing) = events.iter_mut().find(|e| e.token == completion.token as usize) {
+                let bell = completion.token & BELL != 0;
+                let token = (completion.token & !BELL) as usize;
+                let flags = if bell { FLAG_WRITABLE } else { poll_result_to_flags(completion.result as u32) };
+                if let Some(existing) = events.iter_mut().find(|e| e.token == token) {
                     existing.flags |= flags;
                 } else {
-                    events.push(Event {
-                        token: completion.token as usize,
-                        flags,
-                    });
+                    events.push(Event { token, flags });
                 }
             }
             self.inbox.advance_completion();
@@ -216,7 +222,14 @@ impl Selector {
 
     pub fn register_handle(&self, handle: RawHandle, token: Token, interest: Interest) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.registrations.push((handle, interest, token));
+        inner.registrations.push((handle, interest, token, false));
+        Ok(())
+    }
+
+    /// A stream's bell: watched for reading, and its event writable.
+    pub fn register_bell(&self, bell: RawHandle, token: Token) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.registrations.push((bell, Interest::READABLE, token, true));
         Ok(())
     }
 
@@ -226,7 +239,7 @@ impl Selector {
             reg.1 = interest;
             reg.2 = token;
         } else {
-            inner.registrations.push((handle, interest, token));
+            inner.registrations.push((handle, interest, token, false));
         }
         Ok(())
     }
