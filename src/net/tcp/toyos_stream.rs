@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{self, Shutdown, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::toyos::io::AsRawHandle;
 use std::os::toyos::net::TcpStreamExt;
 
 use crate::{event, Interest, Registry, Token};
@@ -77,11 +78,11 @@ impl TcpStream {
     }
 
     fn handle(&self) -> RawHandle {
-        RawHandle(self.inner.as_raw_fd() as u32)
+        RawHandle(self.inner.as_raw_handle())
     }
 
     fn bell(&self) -> io::Result<RawHandle> {
-        Ok(RawHandle(self.inner.bell()? as u32))
+        Ok(RawHandle(self.inner.bell()?))
     }
 }
 

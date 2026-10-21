@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::net::{self, SocketAddr};
-use std::os::fd::AsRawFd;
+use std::os::toyos::io::AsRawHandle;
 
 use crate::net::TcpStream;
 use crate::{event, Interest, Registry, Token};
@@ -47,7 +47,7 @@ impl TcpListener {
     }
 
     fn wakes(&self) -> RawHandle {
-        RawHandle(self.inner.as_raw_fd() as u32)
+        RawHandle(self.inner.as_raw_handle())
     }
 }
 
