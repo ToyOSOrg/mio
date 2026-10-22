@@ -2,7 +2,6 @@ use std::fmt;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{self, Shutdown, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::toyos::io::AsRawHandle;
 use std::os::toyos::net::TcpStreamExt;
 
 use crate::{event, Interest, Registry, Token};
@@ -11,8 +10,8 @@ use toyos_abi::RawHandle;
 /// A non-blocking TCP stream: std's, which on ToyOS is a region and a
 /// connection to netstack.
 ///
-/// Its readiness is two doorbells: its own handle, which netstack rings for
-/// bytes or their end, and its bell, which netstack rings for room or a
+/// Its readiness is two doorbells: its receive bell, which netstack rings for
+/// bytes or their end, and its send bell, which netstack rings for room or a
 /// failure. Each says "look", so a source is read and written until
 /// `WouldBlock`, which arms the want the next ring answers; a registration
 /// arms each named want and rings netstack if its direction is ready already,
@@ -77,8 +76,8 @@ impl TcpStream {
         f()
     }
 
-    fn handle(&self) -> RawHandle {
-        RawHandle(self.inner.as_raw_handle())
+    fn receive_bell(&self) -> io::Result<RawHandle> {
+        Ok(RawHandle(self.inner.receive_bell()?))
     }
 
     fn bell(&self) -> io::Result<RawHandle> {
@@ -138,7 +137,7 @@ impl event::Source for TcpStream {
     fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
         let sel = registry.selector();
         if interests.is_readable() {
-            sel.register_handle(self.handle(), token, Interest::READABLE)?;
+            sel.register_handle(self.receive_bell()?, token, Interest::READABLE)?;
         }
         if interests.is_writable() {
             sel.register_bell(self.bell()?, token)?;
@@ -153,7 +152,7 @@ impl event::Source for TcpStream {
 
     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
         let sel = registry.selector();
-        sel.deregister_handle(self.handle())?;
+        sel.deregister_handle(self.receive_bell()?)?;
         sel.deregister_handle(self.bell()?)
     }
 }
