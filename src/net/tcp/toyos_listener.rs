@@ -7,8 +7,10 @@ use crate::net::TcpStream;
 use crate::{event, Interest, Registry, Token};
 use toyos_abi::RawHandle;
 
-/// A non-blocking TCP listener: std's, whose handle is the pipe netstack
-/// writes one wake into for each connection that waits.
+/// A non-blocking TCP listener: std's, whose handle is its holder's bell.
+/// netstack rings the bell while a connection waits and this holder has not
+/// asked since its last ring, so a readable event is answered by accepting
+/// until `WouldBlock`, and another holder may take a connection first.
 pub struct TcpListener {
     inner: net::TcpListener,
 }
@@ -21,7 +23,8 @@ impl TcpListener {
         Ok(TcpListener { inner })
     }
 
-    /// Accept a new connection: one wake taken, then std's accept.
+    /// Accept a new connection: std's, which asks netstack only once the bell
+    /// rang.
     ///
     /// Returns `WouldBlock` if no connections are pending.
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
@@ -46,7 +49,7 @@ impl TcpListener {
         self.inner.take_error()
     }
 
-    fn wakes(&self) -> RawHandle {
+    fn bell(&self) -> RawHandle {
         RawHandle(self.inner.as_raw_handle())
     }
 }
@@ -54,16 +57,16 @@ impl TcpListener {
 impl event::Source for TcpListener {
     fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
         let _ = interests;
-        registry.selector().register_handle(self.wakes(), token, Interest::READABLE)
+        registry.selector().register_handle(self.bell(), token, Interest::READABLE)
     }
 
     fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
         let _ = interests;
-        registry.selector().reregister_handle(self.wakes(), token, Interest::READABLE)
+        registry.selector().reregister_handle(self.bell(), token, Interest::READABLE)
     }
 
     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        registry.selector().deregister_handle(self.wakes())
+        registry.selector().deregister_handle(self.bell())
     }
 }
 
