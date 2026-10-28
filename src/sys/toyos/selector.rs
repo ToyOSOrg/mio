@@ -1,4 +1,5 @@
 use std::io;
+use std::os::toyos::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +16,7 @@ const BELL: u64 = 1 << 63;
 
 /// A ToyOS inbox: submission and completion rings mapped into userspace.
 struct Inbox {
-    handle: RawHandle,
+    handle: OwnedHandle,
     base: *mut u8,
     submission_ring_size: u32,
     completion_ring_size: u32,
@@ -35,6 +36,9 @@ impl Inbox {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
         // Read the layout from offset 0
         let layout = unsafe { &*(base as *const RingLayout) };
+        // SAFETY: the kernel installed the handle for this call, and this
+        // inbox is the only thing that answers for it.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
         Ok(Self {
             handle,
             base,
@@ -75,7 +79,7 @@ impl Inbox {
     /// Hand every queued submission to the kernel and optionally wait for
     /// completions.
     fn submit(&self, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> io::Result<u32> {
-        toyos_abi::syscall::inbox_submit(self.handle, to_submit, min_complete, timeout_nanos)
+        toyos_abi::syscall::inbox_submit(RawHandle(self.handle.as_raw_handle()), to_submit, min_complete, timeout_nanos)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))
     }
 
@@ -104,12 +108,6 @@ impl Inbox {
         let head = ring.head.load(Ordering::Acquire);
         let tail = ring.tail.load(Ordering::Acquire);
         tail.wrapping_sub(head)
-    }
-}
-
-impl Drop for Inbox {
-    fn drop(&mut self) {
-        toyos_abi::syscall::close(self.handle);
     }
 }
 
