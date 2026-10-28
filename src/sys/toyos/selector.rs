@@ -10,9 +10,23 @@ use toyos_abi::inbox::*;
 
 static NEXT_SELECTOR_ID: AtomicUsize = AtomicUsize::new(1);
 
-/// A watch's token carries this bit where the handle is a stream's bell,
-/// watched for reading and reported as writable (`std::os::toyos::net`).
+/// What a registration's handle is, which its completion's token carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Handle,
+    /// A stream's bell: watched for reading and reported as writable
+    /// (`std::os::toyos::net`).
+    Bell,
+    /// A [`Waker`](super::Waker)'s event: watched for reading, and taken as
+    /// its token is reported, since a watch observes and takes nothing.
+    Waker,
+}
+
+/// A watch's token carries these bits for a registration that is no plain
+/// handle.
 const BELL: u64 = 1 << 63;
+const WAKER: u64 = 1 << 62;
+const KINDS: u64 = BELL | WAKER;
 
 /// A ToyOS inbox: submission and completion rings mapped into userspace.
 struct Inbox {
@@ -121,9 +135,8 @@ struct Registration {
 
 #[derive(Debug)]
 struct SelectorInner {
-    /// Each handle, the interest it is watched for, its token, and whether it
-    /// is a bell.
-    registrations: Vec<(RawHandle, Interest, Token, bool)>,
+    /// Each handle, the interest it is watched for, its token, and what it is.
+    registrations: Vec<(RawHandle, Interest, Token, Kind)>,
 }
 
 #[derive(Clone)]
@@ -175,18 +188,23 @@ impl Selector {
         events.clear();
 
         // Re-arm a watch for every registration
-        let regs: Vec<(RawHandle, Interest, Token, bool)> = {
+        let regs: Vec<(RawHandle, Interest, Token, Kind)> = {
             let inner = self.inner.lock().unwrap();
             inner.registrations.clone()
         };
 
-        for &(handle, interest, token, bell) in &regs {
-            debug_assert!(token.0 as u64 & BELL == 0, "a token past the bell's bit");
+        for &(handle, interest, token, kind) in &regs {
+            debug_assert!(token.0 as u64 & KINDS == 0, "a token past the kinds' bits");
             let mut submission = Submission::default();
             submission.op = OP_WATCH;
             submission.handle = handle;
             submission.op_flags = interests_to_flags(interest);
-            submission.token = token.0 as u64 | if bell { BELL } else { 0 };
+            submission.token = token.0 as u64
+                | match kind {
+                    Kind::Handle => 0,
+                    Kind::Bell => BELL,
+                    Kind::Waker => WAKER,
+                };
             self.inbox.queue(&submission);
         }
 
@@ -203,9 +221,16 @@ impl Selector {
         // Drain all completions
         while let Some(completion) = self.inbox.peek_completion() {
             if completion.result > 0 {
-                let bell = completion.token & BELL != 0;
-                let token = (completion.token & !BELL) as usize;
-                let flags = if bell { FLAG_WRITABLE } else { poll_result_to_flags(completion.result as u32) };
+                let token = (completion.token & !KINDS) as usize;
+                let flags = if completion.token & BELL != 0 { FLAG_WRITABLE } else { poll_result_to_flags(completion.result as u32) };
+                if completion.token & WAKER != 0 {
+                    // Taken before the wake is reported, so one raised after
+                    // this is still pending at the next select.
+                    let waker = regs.iter().find(|r| r.3 == Kind::Waker && r.2 .0 == token);
+                    if let Some(&(handle, ..)) = waker {
+                        let _ = toyos_abi::syscall::event_take(handle);
+                    }
+                }
                 if let Some(existing) = events.iter_mut().find(|e| e.token == token) {
                     existing.flags |= flags;
                 } else {
@@ -220,14 +245,21 @@ impl Selector {
 
     pub fn register_handle(&self, handle: RawHandle, token: Token, interest: Interest) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.registrations.push((handle, interest, token, false));
+        inner.registrations.push((handle, interest, token, Kind::Handle));
         Ok(())
     }
 
     /// A stream's bell: watched for reading, and its event writable.
     pub fn register_bell(&self, bell: RawHandle, token: Token) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.registrations.push((bell, Interest::READABLE, token, true));
+        inner.registrations.push((bell, Interest::READABLE, token, Kind::Bell));
+        Ok(())
+    }
+
+    /// A [`Waker`](super::Waker)'s event, taken as its token is reported.
+    pub fn register_waker(&self, event: RawHandle, token: Token) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.registrations.push((event, Interest::READABLE, token, Kind::Waker));
         Ok(())
     }
 
@@ -237,7 +269,7 @@ impl Selector {
             reg.1 = interest;
             reg.2 = token;
         } else {
-            inner.registrations.push((handle, interest, token, false));
+            inner.registrations.push((handle, interest, token, Kind::Handle));
         }
         Ok(())
     }
