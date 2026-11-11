@@ -10,7 +10,7 @@ use toyos_abi::inbox::*;
 
 static NEXT_SELECTOR_ID: AtomicUsize = AtomicUsize::new(1);
 
-/// What a registration's handle is, which its completion's token carries.
+/// What a registration's handle is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Handle,
@@ -21,12 +21,6 @@ enum Kind {
     /// its token is reported, since a watch observes and takes nothing.
     Waker,
 }
-
-/// A watch's token carries these bits for a registration that is no plain
-/// handle.
-const BELL: u64 = 1 << 63;
-const WAKER: u64 = 1 << 62;
-const KINDS: u64 = BELL | WAKER;
 
 /// A ToyOS inbox: submission and completion rings mapped into userspace.
 struct Inbox {
@@ -125,18 +119,35 @@ impl Inbox {
     }
 }
 
-/// A registration that needs its watch re-armed after each event.
-#[derive(Clone)]
+/// A registration, whose watch is armed again at every select.
+#[derive(Clone, Copy, Debug)]
 struct Registration {
     handle: RawHandle,
     interest: Interest,
     token: Token,
+    kind: Kind,
+    /// Its watches' token: new at each register and reregister, so a
+    /// completion of a watch armed before either names no registration.
+    generation: u64,
 }
 
 #[derive(Debug)]
 struct SelectorInner {
-    /// Each handle, the interest it is watched for, its token, and what it is.
-    registrations: Vec<(RawHandle, Interest, Token, Kind)>,
+    registrations: Vec<Registration>,
+    /// The next registration's generation.
+    next: u64,
+}
+
+impl SelectorInner {
+    fn add(&mut self, handle: RawHandle, interest: Interest, token: Token, kind: Kind) {
+        let generation = self.renew();
+        self.registrations.push(Registration { handle, interest, token, kind, generation });
+    }
+
+    fn renew(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
 }
 
 #[derive(Clone)]
@@ -168,9 +179,7 @@ impl Selector {
     pub fn new() -> io::Result<Selector> {
         let inbox = Inbox::new(64)?;
         Ok(Selector {
-            inner: Arc::new(Mutex::new(SelectorInner {
-                registrations: Vec::new(),
-            })),
+            inner: Arc::new(Mutex::new(SelectorInner { registrations: Vec::new(), next: 0 })),
             inbox: Arc::new(inbox),
             id: NEXT_SELECTOR_ID.fetch_add(1, Ordering::Relaxed),
         })
@@ -188,23 +197,14 @@ impl Selector {
         events.clear();
 
         // Re-arm a watch for every registration
-        let regs: Vec<(RawHandle, Interest, Token, Kind)> = {
-            let inner = self.inner.lock().unwrap();
-            inner.registrations.clone()
-        };
+        let regs: Vec<Registration> = self.inner.lock().unwrap().registrations.clone();
 
-        for &(handle, interest, token, kind) in &regs {
-            debug_assert!(token.0 as u64 & KINDS == 0, "a token past the kinds' bits");
+        for reg in &regs {
             let mut submission = Submission::default();
             submission.op = OP_WATCH;
-            submission.handle = handle;
-            submission.op_flags = interests_to_flags(interest);
-            submission.token = token.0 as u64
-                | match kind {
-                    Kind::Handle => 0,
-                    Kind::Bell => BELL,
-                    Kind::Waker => WAKER,
-                };
+            submission.handle = reg.handle;
+            submission.op_flags = interests_to_flags(reg.interest);
+            submission.token = reg.generation;
             self.inbox.queue(&submission);
         }
 
@@ -218,19 +218,23 @@ impl Selector {
         let min_complete = if regs.is_empty() { 0 } else { 1 };
         self.inbox.submit(pending, min_complete, timeout_nanos)?;
 
-        // Drain all completions
+        // Drained under the lock `deregister_handle` takes: a completion whose
+        // registration is gone, or was made again, is dropped, so no event is
+        // reported for a handle once its deregister has returned.
+        let inner = self.inner.lock().unwrap();
         while let Some(completion) = self.inbox.peek_completion() {
-            if completion.result > 0 {
-                let token = (completion.token & !KINDS) as usize;
-                let flags = if completion.token & BELL != 0 { FLAG_WRITABLE } else { poll_result_to_flags(completion.result as u32) };
-                if completion.token & WAKER != 0 {
+            let reg = inner.registrations.iter().find(|r| r.generation == completion.token);
+            if let (Some(reg), 1..) = (reg, completion.result) {
+                let flags = match reg.kind {
+                    Kind::Bell => FLAG_WRITABLE,
+                    Kind::Handle | Kind::Waker => poll_result_to_flags(completion.result as u32),
+                };
+                if reg.kind == Kind::Waker {
                     // Taken before the wake is reported, so one raised after
                     // this is still pending at the next select.
-                    let waker = regs.iter().find(|r| r.3 == Kind::Waker && r.2 .0 == token);
-                    if let Some(&(handle, ..)) = waker {
-                        let _ = toyos_abi::syscall::event_take(handle);
-                    }
+                    let _ = toyos_abi::syscall::event_take(reg.handle);
                 }
+                let token = reg.token.0;
                 if let Some(existing) = events.iter_mut().find(|e| e.token == token) {
                     existing.flags |= flags;
                 } else {
@@ -244,39 +248,38 @@ impl Selector {
     }
 
     pub fn register_handle(&self, handle: RawHandle, token: Token, interest: Interest) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.registrations.push((handle, interest, token, Kind::Handle));
+        self.inner.lock().unwrap().add(handle, interest, token, Kind::Handle);
         Ok(())
     }
 
     /// A stream's bell: watched for reading, and its event writable.
     pub fn register_bell(&self, bell: RawHandle, token: Token) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.registrations.push((bell, Interest::READABLE, token, Kind::Bell));
+        self.inner.lock().unwrap().add(bell, Interest::READABLE, token, Kind::Bell);
         Ok(())
     }
 
     /// A [`Waker`](super::Waker)'s event, taken as its token is reported.
     pub fn register_waker(&self, event: RawHandle, token: Token) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.registrations.push((event, Interest::READABLE, token, Kind::Waker));
+        self.inner.lock().unwrap().add(event, Interest::READABLE, token, Kind::Waker);
         Ok(())
     }
 
     pub fn reregister_handle(&self, handle: RawHandle, token: Token, interest: Interest) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(reg) = inner.registrations.iter_mut().find(|r| r.0 == handle) {
-            reg.1 = interest;
-            reg.2 = token;
-        } else {
-            inner.registrations.push((handle, interest, token, Kind::Handle));
+        let generation = inner.renew();
+        match inner.registrations.iter_mut().find(|r| r.handle == handle) {
+            Some(reg) => {
+                reg.interest = interest;
+                reg.token = token;
+                reg.generation = generation;
+            }
+            None => inner.registrations.push(Registration { handle, interest, token, kind: Kind::Handle, generation }),
         }
         Ok(())
     }
 
     pub fn deregister_handle(&self, handle: RawHandle) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.registrations.retain(|r| r.0 != handle);
+        self.inner.lock().unwrap().registrations.retain(|r| r.handle != handle);
         Ok(())
     }
 
