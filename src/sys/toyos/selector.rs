@@ -2,7 +2,7 @@ use std::io;
 use std::os::toyos::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{Interest, Token};
 use toyos_abi::RawHandle;
@@ -131,22 +131,68 @@ struct Registration {
     generation: u64,
 }
 
+/// The token the selector's own watch on [`SelectorInner::changed`]'s event
+/// carries: no registration's generation, which starts at 1.
+const CHANGED: u64 = 0;
+
 #[derive(Debug)]
 struct SelectorInner {
     registrations: Vec<Registration>,
     /// The next registration's generation.
     next: u64,
+    /// Watched by every select, and signalled when the registrations change
+    /// while one waits on its copy of them, so that it arms them again: a
+    /// ring has one submitter, so the changing thread cannot arm a watch.
+    changed: OwnedEvent,
+    /// Whether a select is between taking its copy of the registrations and
+    /// draining what it waited for.
+    selecting: bool,
+    /// Whether `changed` has been signalled since a select last took it.
+    signalled: bool,
+}
+
+/// An event's two sides, both the selector's.
+#[derive(Debug)]
+struct OwnedEvent {
+    wait: OwnedHandle,
+    signal: OwnedHandle,
 }
 
 impl SelectorInner {
-    fn add(&mut self, handle: RawHandle, interest: Interest, token: Token, kind: Kind) {
+    fn add(&mut self, handle: RawHandle, interest: Interest, token: Token, kind: Kind) -> io::Result<()> {
+        self.change()?;
         let generation = self.renew();
         self.registrations.push(Registration { handle, interest, token, kind, generation });
+        Ok(())
     }
 
     fn renew(&mut self) -> u64 {
         self.next += 1;
         self.next
+    }
+
+    /// Wake a select waiting on its copy of the registrations, which are
+    /// about to change.
+    fn change(&mut self) -> io::Result<()> {
+        if self.selecting && !self.signalled {
+            // The wait side is this selector's own, so the signal is never refused.
+            toyos_abi::syscall::event_signal(RawHandle(self.changed.signal.as_raw_handle()))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
+            self.signalled = true;
+        }
+        Ok(())
+    }
+
+    /// The registrations, copied for a select about to wait on them.
+    fn to_watch(&mut self) -> Vec<Registration> {
+        if self.signalled {
+            // Taken with the copy below, under the lock every change takes:
+            // a signal after this one is a change the copy does not hold.
+            let _ = toyos_abi::syscall::event_take(RawHandle(self.changed.wait.as_raw_handle()));
+            self.signalled = false;
+        }
+        self.selecting = true;
+        self.registrations.clone()
     }
 }
 
@@ -178,8 +224,16 @@ impl std::fmt::Debug for Inbox {
 impl Selector {
     pub fn new() -> io::Result<Selector> {
         let inbox = Inbox::new(64)?;
+        let event = toyos_abi::syscall::event_create()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
+        // SAFETY: the kernel installed both sides for this call, and this
+        // selector is the only thing that answers for them.
+        let changed = unsafe {
+            OwnedEvent { wait: OwnedHandle::from_raw_handle(event.wait.0), signal: OwnedHandle::from_raw_handle(event.signal.0) }
+        };
+        let inner = SelectorInner { registrations: Vec::new(), next: 0, changed, selecting: false, signalled: false };
         Ok(Selector {
-            inner: Arc::new(Mutex::new(SelectorInner { registrations: Vec::new(), next: 0 })),
+            inner: Arc::new(Mutex::new(inner)),
             inbox: Arc::new(inbox),
             id: NEXT_SELECTOR_ID.fetch_add(1, Ordering::Relaxed),
         })
@@ -195,34 +249,56 @@ impl Selector {
 
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         events.clear();
-
-        // Re-arm a watch for every registration
-        let regs: Vec<Registration> = self.inner.lock().unwrap().registrations.clone();
-
-        for reg in &regs {
-            let mut submission = Submission::default();
-            submission.op = OP_WATCH;
-            submission.handle = reg.handle;
-            submission.op_flags = interests_to_flags(reg.interest);
-            submission.token = reg.generation;
-            self.inbox.queue(&submission);
+        // A timeout past what an `Instant` holds waits for good, as `None` does.
+        let until = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        loop {
+            let left = match until {
+                None => u64::MAX,
+                // `u64::MAX` is the kernel's "for good", so a timeout stops
+                // one short of it.
+                Some(until) => {
+                    let left = until.saturating_duration_since(Instant::now()).as_nanos();
+                    u64::try_from(left).map_or(u64::MAX - 1, |left| left.min(u64::MAX - 1))
+                }
+            };
+            self.wait(events, left)?;
+            // Nothing to report, as after a change to the registrations: arm
+            // them again, and wait out the timeout.
+            if !events.is_empty() || until.is_some_and(|until| Instant::now() >= until) {
+                return Ok(());
+            }
         }
+    }
 
-        let pending = self.inbox.pending_submissions();
-        let timeout_nanos = match timeout {
-            None => u64::MAX,
-            Some(d) => d.as_nanos() as u64,
+    /// Arm a watch for every registration and one for a change to them, wait
+    /// up to `timeout_nanos` for any to answer, and add the registrations'
+    /// answers to `events`.
+    fn wait(&self, events: &mut Events, timeout_nanos: u64) -> io::Result<()> {
+        let (regs, changed) = {
+            let mut inner = self.inner.lock().unwrap();
+            (inner.to_watch(), RawHandle(inner.changed.wait.as_raw_handle()))
         };
+        for reg in &regs {
+            self.inbox.queue(&watch(reg.handle, interests_to_flags(reg.interest), reg.generation));
+        }
+        self.inbox.queue(&watch(changed, READABLE, CHANGED));
 
-        // Hand over every queued submission and wait for at least 1 completion
-        let min_complete = if regs.is_empty() { 0 } else { 1 };
-        self.inbox.submit(pending, min_complete, timeout_nanos)?;
+        // The watch on `changed` is always one to wait for.
+        let pending = self.inbox.pending_submissions();
+        let submitted = self.inbox.submit(pending, 1, timeout_nanos);
 
         // Drained under the lock `deregister_handle` takes: a completion whose
         // registration is gone, or was made again, is dropped, so no event is
-        // reported for a handle once its deregister has returned.
-        let inner = self.inner.lock().unwrap();
+        // reported for a handle once its deregister has returned. `CHANGED`
+        // names no registration.
+        let mut inner = self.inner.lock().unwrap();
+        inner.selecting = false;
+        submitted?;
+        let mut refused = None;
         while let Some(completion) = self.inbox.peek_completion() {
+            if completion.token == CHANGED && completion.result < 1 {
+                refused = Some(completion.result);
+            }
             let reg = inner.registrations.iter().find(|r| r.generation == completion.token);
             if let (Some(reg), 1..) = (reg, completion.result) {
                 let flags = match reg.kind {
@@ -243,29 +319,32 @@ impl Selector {
             }
             self.inbox.advance_completion();
         }
-
-        Ok(())
+        match refused {
+            None => Ok(()),
+            Some(why) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("the kernel refused to watch the selector's own event ({why})"),
+            )),
+        }
     }
 
     pub fn register_handle(&self, handle: RawHandle, token: Token, interest: Interest) -> io::Result<()> {
-        self.inner.lock().unwrap().add(handle, interest, token, Kind::Handle);
-        Ok(())
+        self.inner.lock().unwrap().add(handle, interest, token, Kind::Handle)
     }
 
     /// A stream's bell: watched for reading, and its event writable.
     pub fn register_bell(&self, bell: RawHandle, token: Token) -> io::Result<()> {
-        self.inner.lock().unwrap().add(bell, Interest::READABLE, token, Kind::Bell);
-        Ok(())
+        self.inner.lock().unwrap().add(bell, Interest::READABLE, token, Kind::Bell)
     }
 
     /// A [`Waker`](super::Waker)'s event, taken as its token is reported.
     pub fn register_waker(&self, event: RawHandle, token: Token) -> io::Result<()> {
-        self.inner.lock().unwrap().add(event, Interest::READABLE, token, Kind::Waker);
-        Ok(())
+        self.inner.lock().unwrap().add(event, Interest::READABLE, token, Kind::Waker)
     }
 
     pub fn reregister_handle(&self, handle: RawHandle, token: Token, interest: Interest) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        inner.change()?;
         let generation = inner.renew();
         match inner.registrations.iter_mut().find(|r| r.handle == handle) {
             Some(reg) => {
@@ -287,6 +366,15 @@ impl Selector {
     pub fn id(&self) -> usize {
         self.id
     }
+}
+
+fn watch(handle: RawHandle, op_flags: u32, token: u64) -> Submission {
+    let mut submission = Submission::default();
+    submission.op = OP_WATCH;
+    submission.handle = handle;
+    submission.op_flags = op_flags;
+    submission.token = token;
+    submission
 }
 
 fn interests_to_flags(interest: Interest) -> u32 {
