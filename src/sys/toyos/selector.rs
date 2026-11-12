@@ -151,11 +151,45 @@ struct SelectorInner {
     signalled: bool,
 }
 
-/// An event's two sides, both the selector's.
+/// An event's two sides, both its holder's: the selector's change, and a
+/// [`Waker`](super::Waker)'s wake.
 #[derive(Debug)]
-struct OwnedEvent {
+pub(super) struct OwnedEvent {
     wait: OwnedHandle,
     signal: OwnedHandle,
+}
+
+impl OwnedEvent {
+    pub(super) fn new() -> io::Result<OwnedEvent> {
+        let event = toyos_abi::syscall::event_create().map_err(refused)?;
+        // SAFETY: the kernel installed both sides for this call, and this
+        // event is the only thing that answers for them.
+        unsafe {
+            Ok(OwnedEvent {
+                wait: OwnedHandle::from_raw_handle(event.wait.0),
+                signal: OwnedHandle::from_raw_handle(event.signal.0),
+            })
+        }
+    }
+
+    /// The side a watch is armed on.
+    pub(super) fn wait(&self) -> RawHandle {
+        RawHandle(self.wait.as_raw_handle())
+    }
+
+    /// Raise it. Never refused while this holds the wait side.
+    pub(super) fn signal(&self) -> io::Result<()> {
+        toyos_abi::syscall::event_signal(RawHandle(self.signal.as_raw_handle())).map_err(refused)
+    }
+
+    /// Take a pending signal. Never refused while one is pending.
+    fn take(&self) -> io::Result<()> {
+        toyos_abi::syscall::event_take(self.wait()).map_err(refused)
+    }
+}
+
+fn refused(e: toyos_abi::syscall::SyscallError) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("{e}"))
 }
 
 impl SelectorInner {
@@ -175,24 +209,22 @@ impl SelectorInner {
     /// about to change.
     fn change(&mut self) -> io::Result<()> {
         if self.selecting && !self.signalled {
-            // The wait side is this selector's own, so the signal is never refused.
-            toyos_abi::syscall::event_signal(RawHandle(self.changed.signal.as_raw_handle()))
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
+            self.changed.signal()?;
             self.signalled = true;
         }
         Ok(())
     }
 
     /// The registrations, copied for a select about to wait on them.
-    fn to_watch(&mut self) -> Vec<Registration> {
+    fn to_watch(&mut self) -> io::Result<Vec<Registration>> {
         if self.signalled {
             // Taken with the copy below, under the lock every change takes:
             // a signal after this one is a change the copy does not hold.
-            let _ = toyos_abi::syscall::event_take(RawHandle(self.changed.wait.as_raw_handle()));
+            self.changed.take()?;
             self.signalled = false;
         }
         self.selecting = true;
-        self.registrations.clone()
+        Ok(self.registrations.clone())
     }
 }
 
@@ -204,6 +236,7 @@ pub struct Event {
 
 const FLAG_READABLE: u8 = 1;
 const FLAG_WRITABLE: u8 = 2;
+const FLAG_ERROR: u8 = 4;
 
 pub type Events = Vec<Event>;
 
@@ -224,13 +257,7 @@ impl std::fmt::Debug for Inbox {
 impl Selector {
     pub fn new() -> io::Result<Selector> {
         let inbox = Inbox::new(64)?;
-        let event = toyos_abi::syscall::event_create()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
-        // SAFETY: the kernel installed both sides for this call, and this
-        // selector is the only thing that answers for them.
-        let changed = unsafe {
-            OwnedEvent { wait: OwnedHandle::from_raw_handle(event.wait.0), signal: OwnedHandle::from_raw_handle(event.signal.0) }
-        };
+        let changed = OwnedEvent::new()?;
         let inner = SelectorInner { registrations: Vec::new(), next: 0, changed, selecting: false, signalled: false };
         Ok(Selector {
             inner: Arc::new(Mutex::new(inner)),
@@ -263,7 +290,8 @@ impl Selector {
             };
             self.wait(events, left)?;
             // Nothing to report, as after a change to the registrations: arm
-            // them again, and wait out the timeout.
+            // them again, and wait out the timeout. A refused watch is
+            // reported, and its registration ends, so none is armed again.
             if !events.is_empty() || until.is_some_and(|until| Instant::now() >= until) {
                 return Ok(());
             }
@@ -276,7 +304,7 @@ impl Selector {
     fn wait(&self, events: &mut Events, timeout_nanos: u64) -> io::Result<()> {
         let (regs, changed) = {
             let mut inner = self.inner.lock().unwrap();
-            (inner.to_watch(), RawHandle(inner.changed.wait.as_raw_handle()))
+            (inner.to_watch()?, inner.changed.wait())
         };
         for reg in &regs {
             self.inbox.queue(&watch(reg.handle, interests_to_flags(reg.interest), reg.generation));
@@ -289,41 +317,53 @@ impl Selector {
 
         // Drained under the lock `deregister_handle` takes: a completion whose
         // registration is gone, or was made again, is dropped, so no event is
-        // reported for a handle once its deregister has returned. `CHANGED`
-        // names no registration.
+        // reported for a handle once its deregister has returned.
         let mut inner = self.inner.lock().unwrap();
         inner.selecting = false;
         submitted?;
         let mut refused = None;
+        let mut ended = Vec::new();
         while let Some(completion) = self.inbox.peek_completion() {
-            if completion.token == CHANGED && completion.result < 1 {
-                refused = Some(completion.result);
-            }
-            let reg = inner.registrations.iter().find(|r| r.generation == completion.token);
-            if let (Some(reg), 1..) = (reg, completion.result) {
-                let flags = match reg.kind {
-                    Kind::Bell => FLAG_WRITABLE,
-                    Kind::Handle | Kind::Waker => poll_result_to_flags(completion.result as u32),
-                };
-                if reg.kind == Kind::Waker {
-                    // Taken before the wake is reported, so one raised after
-                    // this is still pending at the next select.
-                    let _ = toyos_abi::syscall::event_take(reg.handle);
-                }
-                let token = reg.token.0;
-                if let Some(existing) = events.iter_mut().find(|e| e.token == token) {
-                    existing.flags |= flags;
-                } else {
-                    events.push(Event { token, flags });
-                }
-            }
             self.inbox.advance_completion();
+            if completion.token == CHANGED {
+                if completion.result < 1 {
+                    refused = Some(refusal(completion.result));
+                }
+                continue;
+            }
+            let Some(reg) = inner.registrations.iter().find(|r| r.generation == completion.token) else {
+                continue;
+            };
+            let flags = match (completion.result, reg.kind) {
+                // The kernel refuses a watch that can never fire, one on a
+                // handle closed under it among them. The registration ends,
+                // reported once as an error in the directions it reports, so
+                // whoever reads or writes the source meets the refusal.
+                (..=0, kind) => {
+                    ended.push(reg.generation);
+                    FLAG_ERROR | reported(kind, reg.interest)
+                }
+                (_, Kind::Bell) => FLAG_WRITABLE,
+                (result, Kind::Handle | Kind::Waker) => poll_result_to_flags(result as u32),
+            };
+            if reg.kind == Kind::Waker && completion.result > 0 {
+                // Taken before the wake is reported, so one raised after
+                // this is still pending at the next select.
+                let _ = toyos_abi::syscall::event_take(reg.handle);
+            }
+            let token = reg.token.0;
+            if let Some(existing) = events.iter_mut().find(|e| e.token == token) {
+                existing.flags |= flags;
+            } else {
+                events.push(Event { token, flags });
+            }
         }
+        inner.registrations.retain(|r| !ended.contains(&r.generation));
         match refused {
             None => Ok(()),
             Some(why) => Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("the kernel refused to watch the selector's own event ({why})"),
+                format!("the kernel refused to watch the selector's own event: {why}"),
             )),
         }
     }
@@ -384,6 +424,27 @@ fn interests_to_flags(interest: Interest) -> u32 {
     flags
 }
 
+/// The directions a registration of `kind` reports readiness in.
+fn reported(kind: Kind, interest: Interest) -> u8 {
+    match kind {
+        Kind::Bell => FLAG_WRITABLE,
+        Kind::Waker => FLAG_READABLE,
+        Kind::Handle => {
+            let mut flags = 0;
+            if interest.is_readable() { flags |= FLAG_READABLE; }
+            if interest.is_writable() { flags |= FLAG_WRITABLE; }
+            flags
+        }
+    }
+}
+
+/// A refused watch's result, which the kernel writes as its error's number
+/// negated.
+fn refusal(result: i32) -> toyos_abi::syscall::SyscallError {
+    use toyos_abi::syscall::SyscallError;
+    SyscallError::from_u64(u64::MAX - u64::from(result.unsigned_abs())).unwrap_or(SyscallError::Unknown)
+}
+
 fn poll_result_to_flags(result: u32) -> u8 {
     let mut flags = 0u8;
     if result & READABLE != 0 { flags |= FLAG_READABLE; }
@@ -409,8 +470,8 @@ pub mod event {
         event.flags & FLAG_WRITABLE != 0
     }
 
-    pub fn is_error(_event: &Event) -> bool {
-        false
+    pub fn is_error(event: &Event) -> bool {
+        event.flags & FLAG_ERROR != 0
     }
 
     pub fn is_read_closed(_event: &Event) -> bool {
@@ -436,10 +497,11 @@ pub mod event {
     pub fn debug_details(f: &mut fmt::Formatter<'_>, event: &Event) -> fmt::Result {
         write!(
             f,
-            "Event {{ token: {}, readable: {}, writable: {} }}",
+            "Event {{ token: {}, readable: {}, writable: {}, error: {} }}",
             event.token,
             event.flags & FLAG_READABLE != 0,
-            event.flags & FLAG_WRITABLE != 0
+            event.flags & FLAG_WRITABLE != 0,
+            event.flags & FLAG_ERROR != 0
         )
     }
 }
